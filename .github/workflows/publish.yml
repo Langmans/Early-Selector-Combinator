@@ -1,0 +1,130 @@
+name: Publish Factorio Mod & GitHub Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers whenever you push a tag starting with 'v' (e.g., v1.0.0)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Permissions needed to create the GitHub release
+    
+    steps:
+    # Step 1: Check out the repository source code
+    - name: Checkout Source Code
+      uses: actions/checkout@v4
+
+    # Step 2: Compile project, parse info.json, and validate git tag matching
+    - name: Package Factorio Mod & Verify Tag
+      shell: pwsh
+      run: |
+        # 1. Parse internal mod settings
+        if (-not (Test-Path "info.json")) {
+            Write-Error "CRITICAL: info.json not found in the root directory."
+            exit 1
+        }
+        $info = Get-Content "info.json" -Raw | ConvertFrom-Json
+        $modName = $info.name
+        $version = $info.version
+        
+        # 2. Safety Version Check (Extracts raw digits from 'refs/tags/v1.0.0')
+        $gitTag = "${{ github.ref_name }}"
+        $expectedTag = "v${version}"
+        
+        Write-Host "Verifying configuration consistency..." -ForegroundColor Cyan
+        Write-Host "-> Git Tag Pushed: $gitTag"
+        Write-Host "-> info.json Mod Version: $version (Expected Tag: $expectedTag)"
+        
+        if ($gitTag -ne $expectedTag) {
+            Write-Error "CRITICAL MISMATCH: Pushed Git Tag ($gitTag) does not match info.json version ($expectedTag)!"
+            Write-Error "Deployment terminated to prevent broken portal updates."
+            exit 1
+        }
+        Write-Host "Version validation passed! Proceeding with packaging..." -ForegroundColor Green
+        
+        # 3. Establish layout definitions
+        $folderName = "${modName}_${version}"
+        $zipName = "${folderName}.zip"
+        $stagingDir = Join-Path $env:GITHUB_WORKSPACE "staging_build"
+        $modStagingDir = Join-Path $stagingDir $folderName
+        $zipPath = Join-Path $env:GITHUB_WORKSPACE $zipName
+        
+        # 4. Clean environments and build staging container
+        if (Test-Path $stagingDir) { Remove-Item -Recurse -Force $stagingDir }
+        if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+        
+        New-Item -ItemType Directory -Force -Path $modStagingDir | Out-Null
+        Copy-Item -Path .\* -Destination $modStagingDir -Recurse -Exclude @(".git*", "*.zip", ".github*", "staging_build")
+        
+        # 5. Compress structure
+        Compress-Archive -Path $modStagingDir -DestinationPath $zipPath -Force
+        Remove-Item -Recurse -Force $stagingDir
+        Write-Host "Package compiled successfully: $zipName" -ForegroundColor Green
+
+    # Step 3: Automatically locate the generated .zip file path
+    - name: Find Zip Package Path
+      id: find-zip
+      run: |
+        ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
+        echo "zip_path=$ZIP_FILE" >> $GITHUB_OUTPUT
+
+    # Step 4: Create GitHub Release FIRST and attach the .zip asset
+    - name: Create GitHub Release
+      id: create_release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ${{ steps.find-zip.outputs.zip_path }} # Attaches the specific version zip file
+        generate_release_notes: true                  # Automatically lists commit history titles
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}     # Managed automatically by GitHub
+
+    # Step 5: Upload the compiled asset to the Factorio Mod Portal SECOND
+    - name: Publish to Factorio Portal
+      shell: pwsh
+      env:
+        FACTORIO_TOKEN: ${{ secrets.FACTORIO_API_KEY }}
+      run: |
+        $zipPath = "${{ steps.find-zip.outputs.zip_path }}"
+        $zipName = Split-Path $zipPath -Leaf
+        
+        Write-Host "Uploading $zipName to Factorio Mod Portal..." -ForegroundColor Yellow
+        $uri = "https://factorio.com"
+        $boundary = [System.Guid]::NewGuid().ToString()
+        $LF = "`r`n"
+        
+        $fileBytes = [System.IO.File]::ReadAllBytes($zipPath)
+        $bodyLines = (
+            "--$boundary",
+            'Content-Disposition: form-data; name="authorization"',
+            "",
+            "Bearer $env:FACTORIO_TOKEN",
+            "--$boundary",
+            "Content-Disposition: form-data; name=`"file`"; filename=`"$zipName`"",
+            "Content-Type: application/zip",
+            ""
+        ) -join $LF
+        
+        $headerBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyLines + $LF)
+        $footerBytes = [System.Text.Encoding]::UTF8.GetBytes($LF + "--$boundary--" + $LF)
+        
+        $requestBytes = New-Object Byte[] ($headerBytes.Length + $fileBytes.Length + $footerBytes.Length)
+        [System.Buffer]::BlockCopy($headerBytes, 0, $requestBytes, 0, $headerBytes.Length)
+        [System.Buffer]::BlockCopy($fileBytes, 0, $requestBytes, $headerBytes.Length, $fileBytes.Length)
+        [System.Buffer]::BlockCopy($footerBytes, 0, $requestBytes, ($headerBytes.Length + $fileBytes.Length), $footerBytes.Length)
+        
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Method Post -ContentType "multipart/form-data; boundary=$boundary" -Body $requestBytes
+            Write-Host "Successfully published to Factorio portal! Release ID: $($response.release.id)" -ForegroundColor Green
+        }
+        catch {
+            Write-Error "Factorio Portal Upload failed: $_"
+            if ($_.Exception.Response) {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                Write-Host "Server Response: $($reader.ReadToEnd())" -ForegroundColor Red
+            }
+            exit 1
+        }
