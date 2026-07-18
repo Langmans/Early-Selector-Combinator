@@ -1,0 +1,8 @@
+# Staging and compilation files
+staging_build/
+*.zip
+
+# OS / Editor specific
+.DS_Store
+Thumbs.db
+.vscode/
