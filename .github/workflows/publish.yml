@@ -3,86 +3,76 @@ name: Publish Factorio Mod & GitHub Release
 on:
   push:
     tags:
-      - 'v*' # Triggers whenever you push a tag starting with 'v' (e.g., v1.0.0)
+      - 'v*' # Triggers wanneer je een tag pusht die begint met 'v' (bijv. v1.0.1)
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Permissions needed to create the GitHub release
+      contents: write # Nodig om de GitHub release aan te maken
     
     steps:
-    # Step 1: Check out the repository source code
+    # Stap 1: Broncode ophalen
     - name: Checkout Source Code
       uses: actions/checkout@v4
 
-    # Step 2: Compile project, parse info.json, and validate git tag matching
+    # Stap 2: Project compileren, info.json uitlezen en tag valideren
     - name: Package Factorio Mod & Verify Tag
       shell: pwsh
       run: |
-        # 1. Parse internal mod settings
         if (-not (Test-Path "info.json")) {
-            Write-Error "CRITICAL: info.json not found in the root directory."
+            Write-Error "CRITICAL: info.json niet gevonden in de hoofdmap."
             exit 1
         }
         $info = Get-Content "info.json" -Raw | ConvertFrom-Json
         $modName = $info.name
         $version = $info.version
         
-        # 2. Safety Version Check (Extracts raw digits from 'refs/tags/v1.0.0')
         $gitTag = "${{ github.ref_name }}"
         $expectedTag = "v${version}"
         
-        Write-Host "Verifying configuration consistency..." -ForegroundColor Cyan
-        Write-Host "-> Git Tag Pushed: $gitTag"
-        Write-Host "-> info.json Mod Version: $version (Expected Tag: $expectedTag)"
-        
+        Write-Host "Versiecontroles uitvoeren..." -ForegroundColor Cyan
         if ($gitTag -ne $expectedTag) {
-            Write-Error "CRITICAL MISMATCH: Pushed Git Tag ($gitTag) does not match info.json version ($expectedTag)!"
-            Write-Error "Deployment terminated to prevent broken portal updates."
+            Write-Error "CRITICAL MISMATCH: Gepushte Git Tag ($gitTag) komt niet overeen met info.json versie ($expectedTag)!"
             exit 1
         }
-        Write-Host "Version validation passed! Proceeding with packaging..." -ForegroundColor Green
         
-        # 3. Establish layout definitions
         $folderName = "${modName}_${version}"
         $zipName = "${folderName}.zip"
         $stagingDir = Join-Path $env:GITHUB_WORKSPACE "staging_build"
         $modStagingDir = Join-Path $stagingDir $folderName
         $zipPath = Join-Path $env:GITHUB_WORKSPACE $zipName
         
-        # 4. Clean environments and build staging container
         if (Test-Path $stagingDir) { Remove-Item -Recurse -Force $stagingDir }
         if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
         
         New-Item -ItemType Directory -Force -Path $modStagingDir | Out-Null
         Copy-Item -Path .\* -Destination $modStagingDir -Recurse -Exclude @(".git*", "*.zip", ".github*", "staging_build")
         
-        # 5. Compress structure
         Compress-Archive -Path $modStagingDir -DestinationPath $zipPath -Force
         Remove-Item -Recurse -Force $stagingDir
-        Write-Host "Package compiled successfully: $zipName" -ForegroundColor Green
+        Write-Host "Pakket succesvol gecompileerd: $zipName" -ForegroundColor Green
 
-    # Step 3: Automatically locate the generated .zip file path
+    # Stap 3: Het pad van het gegenereerde .zip-bestand dynamisch opzoeken
     - name: Find Zip Package Path
       id: find-zip
       run: |
         ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
         echo "zip_path=$ZIP_FILE" >> $GITHUB_OUTPUT
 
-    # Step 4: Create GitHub Release FIRST and attach the .zip asset
+    # Stap 4: EERST de GitHub Release aanmaken en het .zip-bestand bijvoegen
     - name: Create GitHub Release
       id: create_release
       uses: softprops/action-gh-release@v2
       with:
-        files: ${{ steps.find-zip.outputs.zip_path }} # Attaches the specific version zip file
-        generate_release_notes: true                  # Automatically lists commit history titles
+        files: ${{ steps.find-zip.outputs.zip_path }}
+        generate_release_notes: true
         draft: false
         prerelease: false
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}     # Managed automatically by GitHub
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    # Step 5: Upload the compiled asset to the Factorio Mod Portal SECOND
+    # Stap 5: DAARNA uploaden naar de Factorio Mod Portal via het 2-staps API-proces
     - name: Publish to Factorio Portal
       shell: pwsh
       env:
@@ -91,17 +81,42 @@ jobs:
         $zipPath = "${{ steps.find-zip.outputs.zip_path }}"
         $zipName = Split-Path $zipPath -Leaf
         
-        Write-Host "Uploading $zipName to Factorio Mod Portal..." -ForegroundColor Yellow
-        $uri = "https://factorio.com"
+        # Haal de mod-naam op uit het zip-bestand (alles voor de underscore)
+        $modName = $zipName.Split('_')[0]
+        
+        Write-Host "Stap 1: Upload initialiseren voor mod '$modName'..." -ForegroundColor Cyan
+        
+        $initUri = "https://factorio.com"
+        $headers = @{
+            "Authorization" = "Bearer $env:FACTORIO_TOKEN"
+        }
+        $body = @{
+            "mod" = $modName
+        }
+        
+        try {
+            # Vraag de unieke upload URL aan
+            $initResponse = Invoke-RestMethod -Uri $initUri -Method Post -Headers $headers -Body $body
+            $uploadUrl = $initResponse.upload_url
+            Write-Host "Upload geautoriseerd. Unieke URL ontvangen." -ForegroundColor Green
+        }
+        catch {
+            Write-Error "Initialisatie mislukt: $_"
+            if ($_.Exception.Response) {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                Write-Host "Server Response: $($reader.ReadToEnd())" -ForegroundColor Red
+            }
+            exit 1
+        }
+        
+        Write-Host "Stap 2: Bestand $zipName uploaden naar Factorio Portal..." -ForegroundColor Yellow
+        
+        # Multipart form-data handmatig opbouwen voor de ontvangen upload URL
         $boundary = [System.Guid]::NewGuid().ToString()
         $LF = "`r`n"
-        
         $fileBytes = [System.IO.File]::ReadAllBytes($zipPath)
+        
         $bodyLines = (
-            "--$boundary",
-            'Content-Disposition: form-data; name="authorization"',
-            "",
-            "Bearer $env:FACTORIO_TOKEN",
             "--$boundary",
             "Content-Disposition: form-data; name=`"file`"; filename=`"$zipName`"",
             "Content-Type: application/zip",
@@ -117,11 +132,12 @@ jobs:
         [System.Buffer]::BlockCopy($footerBytes, 0, $requestBytes, ($headerBytes.Length + $fileBytes.Length), $footerBytes.Length)
         
         try {
-            $response = Invoke-RestMethod -Uri $uri -Method Post -ContentType "multipart/form-data; boundary=$boundary" -Body $requestBytes
-            Write-Host "Successfully published to Factorio portal! Release ID: $($response.release.id)" -ForegroundColor Green
+            # Stuur het bestand naar de unieke upload-URL (ZONDER de Authorization header, de URL bevat al de geldige token/sessie)
+            $response = Invoke-RestMethod -Uri $uploadUrl -Method Post -ContentType "multipart/form-data; boundary=$boundary" -Body $requestBytes
+            Write-Host "Succesvol gepubliceerd op de Factorio portal! Release ID: $($response.release.id)" -ForegroundColor Green
         }
         catch {
-            Write-Error "Factorio Portal Upload failed: $_"
+            Write-Error "Upload mislukt: $_"
             if ($_.Exception.Response) {
                 $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
                 Write-Host "Server Response: $($reader.ReadToEnd())" -ForegroundColor Red
