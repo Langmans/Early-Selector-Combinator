@@ -1,0 +1,9 @@
+{
+    "name": "early-selector-combinator",
+    "version": "1.0.0",
+    "title": "Early Selector Combinator",
+    "author": "Langmans",
+    "factorio_version": "2.0",
+    "description": "Moves the Selector Combinator to the basic Circuit Network technology.",
+    "dependencies": ["base >= 2.0.0"]
+}
